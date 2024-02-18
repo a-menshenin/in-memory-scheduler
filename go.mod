@@ -1,4 +1,4 @@
-module a-menshenin/in-memory-scheduler
+module github.com/a-menshenin/in-memory-scheduler
 
 go 1.21.0
 
