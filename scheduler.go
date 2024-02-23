@@ -1,7 +1,6 @@
 package inmemoryscheduler
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -10,106 +9,126 @@ import (
 
 var InputData []interface{}
 
-const (
-	OneTimeTaskType = "one_time"
-	SheduleTaskType = "schedule"
-)
-
 type (
-	Task struct {
-		taskType string
-		schedule string
-		inputFunc func() error
-		startDate time.Time
+	Schedule string
+	Task     struct {
+		taskName    string
+		startTime   time.Time
+		runInterval *time.Duration
+		payload     []interface{}
 	}
+	TaskType          string
 	InMemoryScheduler struct {
 		workerPoolCount int
-		taskCh chan Task
-		logger zap.Logger
+		taskCh          chan Task
+		closeCh         chan struct{}
+		scheduleTicker  *time.Ticker
+		wg              *sync.WaitGroup
+		logger          zap.Logger
+		handlers        map[string]handler
 	}
+
+	handler func(payload []interface{}) error
 )
 
-func NewTask(taskType string, schedule string, inputFunc func() error, startDate time.Time) *Task {
-	return &Task{taskType, schedule, inputFunc, startDate}
+func NewTask(
+	taskName string,
+	startDate time.Time,
+	payload []interface{},
+	runInterval *time.Duration,
+) (*Task, error) {
+	return &Task{taskName, startDate, runInterval, payload}, nil
 }
 
-func(t *Task) Handle() error {
-	err := t.inputFunc()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (t *Task) GetType() string {
-	return t.taskType
-}
-
-func (t *Task) GetSchedule() string {
-	return t.schedule
+func (t *Task) GetRunInterval() *time.Duration {
+	return t.runInterval
 }
 
 func NewInMemoryScheduler(workerPoolCount int) *InMemoryScheduler {
 	logger, _ := zap.NewProduction()
-	
-	return &InMemoryScheduler{
+
+	s := &InMemoryScheduler{
 		workerPoolCount,
-		make(chan Task),
+		make(chan Task, workerPoolCount),
+		make(chan struct{}),
+		time.NewTicker(1 * time.Second),
+		&sync.WaitGroup{},
 		*logger,
+		make(map[string]handler),
 	}
+
+	s.wg.Add(s.workerPoolCount)
+
+	for i := 0; i < s.workerPoolCount; i++ {
+		go s.worker()
+	}
+
+	return s
+}
+
+func (s *InMemoryScheduler) RegisterHandler(TaskName string, handler func(payload []interface{}) error) {
+	s.handlers[TaskName] = handler
+}
+
+func (s *InMemoryScheduler) UnregisterHandler(TaskName string, handler func(payload []interface{}) error) {
+	delete(s.handlers, TaskName)
 }
 
 func (s *InMemoryScheduler) AddTask(task Task) {
 	s.taskCh <- task
 }
 
-func (s *InMemoryScheduler) AddTasks(tasks []Task) {
-	for _, task := range tasks {
-		s.taskCh <- task
+func (s *InMemoryScheduler) Close() {
+	close(s.closeCh)
+	s.wg.Wait()
+	s.scheduleTicker.Stop()
+
+	for t := range s.taskCh {
+		s.logger.Warn("Task not handled", zap.Any("task", t))
 	}
 }
 
-func (s *InMemoryScheduler) Run(ctx context.Context) {
-	wg := &sync.WaitGroup{}
-	wg.Add(s.workerPoolCount)
-
-	quit := make(chan struct{})
-	ch := make(chan Task, s.workerPoolCount)
-	for i := 0; i < s.workerPoolCount; i++ {
-		go s.worker(ctx, ch, wg, quit)
-	}
-
-	wg.Wait()
-
-	s.logger.Error("All tasks handled!")
-}
-
-func (s *InMemoryScheduler) worker(ctx context.Context, taskCh chan Task, wg *sync.WaitGroup, quitCh chan struct{}) {
+func (s *InMemoryScheduler) worker() {
 	s.logger.Error("worker started")
 	defer func() {
 		s.logger.Error("worker stopped")
-		wg.Done()
+		s.wg.Done()
 	}()
 
 	for {
 		select {
-		case <-quitCh:
+		case <-s.closeCh:
 			return
-		case t := <-taskCh:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				switch t.GetType() {
-				case OneTimeTaskType:
-					err := t.Handle()
-					if err != nil {
-						s.logger.Sugar().Errorf("OneTimeTaskType error: %w", err)
-					}
+		case <-s.scheduleTicker.C:
+			currentTime := time.Now()
+			t := <-s.taskCh
 
-					s.logger.Info("OneTimeTask handled")
-				}
-			}()
+			// Если время начала таски позже текущего, то ложим обратно и пропускаем
+			if t.startTime.After(currentTime) {
+				s.taskCh <- t
+
+				continue
+			}
+
+			h, handlerExists := s.handlers[t.taskName]
+			if !handlerExists {
+				s.logger.Sugar().Errorf("Handler for task %s does not exist", t.taskName)
+
+				continue
+			}
+
+			err := h(t.payload)
+			if err != nil {
+				s.logger.Error("Task error", zap.Any("task", t), zap.Error(err))
+			} else {
+				s.logger.Info("OneTimeTask handled")
+			}
+
+			// Если интервал передан, то прибавляем к текущему времени после исполнения интервал и снова ложим в канал с тасками
+			if t.runInterval != nil {
+				t.startTime = time.Now().Add(*t.runInterval)
+				s.taskCh <- t
+			}
 		}
 	}
 }
