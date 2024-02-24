@@ -1,6 +1,7 @@
 package inmemoryscheduler
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -79,7 +80,9 @@ func (s *InMemoryScheduler) AddTask(task Task) {
 }
 
 func (s *InMemoryScheduler) Close() {
-	close(s.closeCh)
+	for i := 0; i < s.workerPoolCount; i++ {
+		s.closeCh <- struct{}{}
+	}
 	s.wg.Wait()
 	s.scheduleTicker.Stop()
 
@@ -98,6 +101,7 @@ func (s *InMemoryScheduler) worker() {
 	for {
 		select {
 		case <-s.closeCh:
+			fmt.Println("Receive from closeCh")
 			return
 		case <-s.scheduleTicker.C:
 			currentTime := time.Now()
@@ -112,7 +116,7 @@ func (s *InMemoryScheduler) worker() {
 
 			h, handlerExists := s.handlers[t.taskName]
 			if !handlerExists {
-				s.logger.Sugar().Errorf("Handler for task %s does not exist", t.taskName)
+				s.logger.Sugar().Errorf("Handler for task \"%s\" does not exist", t.taskName)
 
 				continue
 			}
